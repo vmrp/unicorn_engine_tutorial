@@ -10,12 +10,12 @@ GITHUB项目地址：https://github.com/unicorn-engine/unicorn
 
 一个中文API文档：https://github.com/kabeor/Micro-Unicorn-Engine-API-Documentation
 
-它只是一个CPU模拟器，所以它的API非常简洁，它提供了各种编程语言的绑定，你可以选择喜欢编程语言进行开发，被加载到unicorn中执行的程序它对内存的每一次读写，每一条指令的执行都在你的掌控之中，并且它是完全无感知的
+它只是一个CPU模拟器，所以它的API非常简洁，它提供了各种编程语言的绑定，你可以选择喜欢编程语言进行开发，被加载到unicorn中执行的程序对内存的每一次读写，每一条指令的执行都在你的掌控之中，并且被unicorn加载运行的程序对这一切是完全无感知的
 
 
 ## 准备工作
 
-写这篇文章的目的是帮助理解我的开源模拟器 [vmrp](https://github.com/zengming00/vmrp) 的工作原理，因此这里介绍的是windows下用c语言开发arm模拟器，网络其它的unicorn文章也仅仅只描述了简单的应用，对于一些关键的核心问题并没有给出答案
+写这篇文章的目的是帮助理解我的开源模拟器 [vmrp](https://github.com/zengming00/vmrp) 的工作原理，因此这里介绍的是windows下用c语言开发arm模拟器，网络上其它的unicorn文章也仅仅只描述了简单的应用，对于一些关键的核心问题并没有给出答案
 
 使用到的GCC编译器：
 https://sourceforge.net/projects/mingw-w64/files/Toolchains%20targetting%20Win64/Personal%20Builds/mingw-builds/8.1.0/threads-posix/sjlj/x86_64-8.1.0-release-posix-sjlj-rt_v6-rev0.7z
@@ -43,7 +43,7 @@ add r2,r0,r1   // 将r0+r1的运算结果送入寄存器r2
 ```
 这里推荐一个学习arm汇编的工具：https://github.com/linouxis9/ARMStrong
 
-为了方便演示，下面的代码都没有对unicorn调用的返回值做判断
+为了方便演示，简化代码，下面的代码假设每一步都是成功的，所以没有错误处理的部分，实际应用时应该对unicorn api的返回值做判断
 ```c
 #include <stdio.h>
 #include <stdint.h>
@@ -129,7 +129,7 @@ E3 A0 00 01    E3 A0 10 02    E0 80 20 01
 
 ## ARM模式和THUMB模式
 
-ARM模式每条指令占用4个字节，而THUMB模式每条指令只占用2个字节，两种模式的指令是可以同时出现在同一个可执行文件中的，主要原因是使用thumb模式编译的文件会比arm模式减少大约30%的内存占用，在嵌入式设备中是很可观的，缺点自然是效率不如arm模式高。
+ARM模式每条指令占用4个字节，而THUMB模式每条指令只占用2个字节，两种模式的指令是可以同时出现在同一个可执行文件中的，主要原因是使用thumb模式编译的文件会比arm模式减少大约30%的体积，在嵌入式设备中是很可观的，缺点自然是效率不如arm模式高。
 
 两种模式的代码之间通常是由带'x'后辍的跳转指令自动切换arm与thumb，直接混合在一起是无法运行的
 
@@ -265,10 +265,10 @@ int32_t add(uc_engine *uc, int32_t a, int32_t b) {
 
     // 根据函数的调用机制，要求我们必需设置一个返回点，这个返回点正是函数执行完毕的标志
     // 由于函数内部会执行到内存中的什么位置我们是不确定的（在我们这个例子中我们当然知道它会执行到哪里）
-    // 并且在uc_emu_start()中也有一个停止点，这个停止点非常强硬，如果pc指针与这个值相同程序就会立刻终止
+    // 并且在uc_emu_start()中也有一个停止点，这个停止点非常强硬，如果pc指针到达这个地址程序就会立刻终止
     // 因此这个地址必需是一个目标函数永远不可能执行到的点，而且这个地址又必需是在已映射的内存范围内
-    // 因为在这个例子中add函数永远不可能执行到ADDRESS地址，因此当add函数内部经由bx lr返回后
-    // pc指针到达uc_emu_start()设置的停止点，模拟器才能停止运行
+    // 在我这个例子中add函数永远不可能执行到ADDRESS地址，所以我将停止点设置成了ADDRESS，因此当add函数内部经由bx lr返回后
+    // pc指针将会到达uc_emu_start()设置的停止点，模拟器才能停止运行，回到我们的代码
     lr = ADDRESS;
     uc_reg_write(uc, UC_ARM_REG_LR, &lr);
 
@@ -295,6 +295,70 @@ int main() {
 
 ## 拦截函数调用
 
+上一个案例讲述了由我们调用目标函数的方法，实际上目标函数内部是有可能会有一些系统调用的，系统调用正是双向通信中对方调用我们，该怎么做呢？
+
+还是以之前的函数案例来研究，我们发现在0x8020和0x8028处都调用了add函数，这个函数的地址我们是知道的，如果能实现把add函数调用替换成调用我们另外实现的一个add函数，那不就相当于目标程序调用了系统函数？
+
+CPU是按照PC寄存器指向的地址来执行代码的，因此当PC寄存器指向add函数的地址时，就是我们下手的时机
+
+这里需要增加一个新的unicorn API调用uc_hook_add()，通过这个API实现控制目标程序的各种行为，比如内存读写、指令执行，以及获取unicorn本身的运行状态
+
+```c
+#define ADDRESS 0x8000
+
+void add(uc_engine *uc) {
+    int32_t a, b, ret;
+    uint32_t lr;
+
+    // 获取参数值
+    uc_reg_read(uc, UC_ARM_REG_R0, &a);
+    uc_reg_read(uc, UC_ARM_REG_R1, &b);
+
+    ret = a + b + 1;
+
+    // 设置返回值
+    uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+
+    // 模拟实现bx lr的功能
+    uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+    uc_reg_write(uc, UC_ARM_REG_PC, &lr);
+}
+
+void hook(uc_engine *uc, uint64_t address, uint32_t size, void *user_data) {
+    if (0x8010 == (uint32_t)address) {  // 当模拟器内执行到add函数地址时，进入我们的add函数进行处理
+        add(uc);
+    }
+}
+
+int main() {
+    uc_engine *uc;
+    uc_hook hh;
+    uint32_t r0;
+
+    uint32_t code[] = {0xE1A0200F, 0xE2823008, 0xE2824010, 0xE12FFF14, 0xE0800001, 0xE12FFF1E, 0xE3A0000B, 0xE3A01016, 0xE12FFF33, 0xE3A01021, 0xE12FFF33, 0xE1A00000};
+
+    uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc);
+    uc_mem_map(uc, ADDRESS, 1024 * 4, UC_PROT_ALL);
+    uc_mem_write(uc, ADDRESS, code, sizeof(code));
+
+    // 这里我在整个代码地址范围内加上单条指令的hook，每次执行这个地址范围内的指令前都会回调我们的hook函数
+    // 如果你可以很明确的知道在哪个地址范围内需要hook，设置一个准确的地址范围能提升程序的运行效率
+    uc_hook_add(uc, &hh, UC_HOOK_CODE, hook, NULL, ADDRESS, ADDRESS + sizeof(code));
+
+    uc_emu_start(uc, ADDRESS, ADDRESS + sizeof(code), 0, 0);
+
+    uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+    printf("r0 = %d\n", r0);
+    uc_close(uc);
+    return 0;
+}
+```
+
+由于我们实现的add函数每次都会额外+1，所以原本的结果应该是66现在变成了68
+
+之前：(11+22)+33=66
+
+之后：(11+22+1)+33+1=68
 
 ## 内存管理
 
