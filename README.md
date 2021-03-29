@@ -15,7 +15,9 @@ GITHUB项目地址：https://github.com/unicorn-engine/unicorn
 
 ## 准备工作
 
-写这篇文章的目的是帮助理解我的开源模拟器 [vmrp](https://github.com/zengming00/vmrp) 的工作原理，因此这里介绍的是windows下用c语言开发arm模拟器，网络上其它的unicorn文章也仅仅只描述了简单的应用，对于一些关键的核心问题并没有给出答案
+写这篇文章的目的是帮助理解我的开源模拟器 [vmrp](https://github.com/zengming00/vmrp) 的工作原理，因此这里介绍的是windows下用c语言开发arm模拟器，网络上其它的unicorn文章也仅仅只描述了简单的应用，对于一些关键的核心问题并没有给出答案。
+
+此文列举的几个案例都是为了学习单一知识点而精心设计的简单案例，刻意省去了堆栈操作因此和实战是不一样的，在最后会介绍到堆栈操作，因此想要应用到实战，必需学习完此文的所有内容。
 
 使用到的GCC编译器：
 https://sourceforge.net/projects/mingw-w64/files/Toolchains%20targetting%20Win64/Personal%20Builds/mingw-builds/8.1.0/threads-posix/sjlj/x86_64-8.1.0-release-posix-sjlj-rt_v6-rev0.7z
@@ -375,10 +377,50 @@ int main() {
 
 之后：(11+22+1)+33+1=68
 
+## 可变参数的函数调用
+
+最常见的可变参数函数是printf()，如果模拟器内的代码需要调用这样的函数我们实现起来是比较复杂的，一种比较简单的方式是写一个转换函数编译成机器码加载进模拟器，当需要调用这种函数时跳转到转换函数去执行，转换函数将参数处理后转换成固定参数的函数调用，以此实现简化处理
+
+我在遇到这个问题时采用的就是这种策略，将 https://github.com/mpaland/printf 编译后加载进模拟器内，这样无论printf()的用法有多复杂，我只需要实现putchar()就能实现字符串输出功能
+
+
 ## 内存管理
 
+内存管理是一个重点知识，因为在C语言中malloc()和free()的地位非常高，我们与模拟器中的函数通信时像int之类的基本数据类型是可以直接传递的，因为它们都是值复制形式传递，但是一旦出现字符串、数组、结构体就无能为力了，因为它们传递的都是指针，实际的数据要求我们先放入一块内存中，我们可以通过uc_mem_map()再申请一块内存，然后用uc_mem_write()把数据写进去，这样做的确可以实现预期的效果，但是有两个弊端：
 
-## 可变参数的函数调用
+1. uc_mem_map()要求内存必需4k对齐，也就是说哪怕你只需要几个字节它也至少会分配4k内存。
+2. uc_mem_map()和uc_mem_write()都必需手动管理内存地址和长度，使用起来极其不方便。
+
+unicorn给我们提供了另一个分配内存的方式：
+```c
+uc_err uc_mem_map_ptr(uc_engine *uc, uint64_t address, size_t size, uint32_t perms, void *ptr);
+```
+这个api与uc_mem_map()相比只增加了最后的ptr参数，意思是我们可以将一块本机内存映射到模拟器中，似乎这个方法要比之前的要方便许多，但实际上它的要求一点都不比uc_mem_map()少。
+
+先来考虑一个问题，在arm和x86都是通过内存地址访问内存，唯一的区别可能就是大小端字节序的问题，如果字节序不同，写一个转换程序转换一下就行了，在我们这个模拟器里无论是本机还是模拟器都小端模式，因此两者的内存是完全可以直接访问的。
+
+搞清楚了这个问题再看uc_mem_map_ptr()实际上它是给我们提供了一个能够完全自由访问模拟器内存的机会
+```c
+#define ADDRESS            0x8000
+#define TOTAL_MEMORY       1024 * 1024 * 4
+
+uint8_t *mem = malloc(TOTAL_MEMORY);   // 模拟器的全部内存
+uc_mem_map_ptr(uc, ADDRESS, TOTAL_MEMORY, UC_PROT_ALL, mem);
+```
+采用这种方式给模拟器初始化内存后，我们对mem的读写会直接影响到模拟器里面运行的程序，同时模拟器里面的程序对内存的读写也会立刻影响到本机代码，也就是说模拟器里外都是同一片内存。
+
+这里面唯一需要注意的是内存地址的区别，在模拟器里面这块内存的首地址是我们设置的0x8000，如果直接拿模拟器返回的地址当指针用的话一定是会出错的，因此在与模拟器内部通信时必需要经过一次地址转换：
+```c
+// 模拟器内部地址转换成指针
+void *toPtr(uint32_t addr) {
+    return mem + (addr - ADDRESS);
+}
+
+// 指针转换成模拟器内部地址
+uint32_t toAddr(void *ptr) {
+    return ((uint8_t *)ptr - mem) + ADDRESS;
+}
+```
 
 
 
