@@ -17,7 +17,7 @@ GITHUB项目地址：https://github.com/unicorn-engine/unicorn
 
 写这篇文章的目的是帮助理解我的开源模拟器 [vmrp](https://github.com/zengming00/vmrp) 的工作原理，因此这里介绍的是windows下用c语言开发arm模拟器，网络上其它的unicorn文章也仅仅只描述了简单的应用，对于一些关键的核心问题并没有给出答案。
 
-此文列举的几个案例都是为了学习单一知识点而精心设计的简单案例，刻意省去了堆栈操作因此和实战是不一样的，在最后会介绍到堆栈操作，因此想要应用到实战，必需学习完此文的所有内容。
+此文列举的几个案例都是为了学习单一知识点而精心设计的简单案例，刻意省去了堆栈操作，因此和实战是不一样的，在最后会介绍到堆栈操作，因此想要应用到实战，必需学习完此文的所有内容。
 
 使用到的GCC编译器：
 https://sourceforge.net/projects/mingw-w64/files/Toolchains%20targetting%20Win64/Personal%20Builds/mingw-builds/8.1.0/threads-posix/sjlj/x86_64-8.1.0-release-posix-sjlj-rt_v6-rev0.7z
@@ -395,11 +395,10 @@ unicorn给我们提供了另一个分配内存的方式：
 ```c
 uc_err uc_mem_map_ptr(uc_engine *uc, uint64_t address, size_t size, uint32_t perms, void *ptr);
 ```
-这个api与uc_mem_map()相比只增加了最后的ptr参数，意思是我们可以将一块本机内存映射到模拟器中，似乎这个方法要比之前的要方便许多，但实际上它的要求一点都不比uc_mem_map()少。
+这个api与uc_mem_map()相比只增加了最后的ptr参数，这使我们可以直接将一块存有数据的内存映射到模拟器中，省去了uc_mem_write()的操作，似乎这个方法要比之前的要方便，但实际上它同样要求4k对齐和手动管理内存地址。
 
-先来考虑一个问题，在arm和x86都是通过内存地址访问内存，唯一的区别可能就是大小端字节序的问题，如果字节序不同，写一个转换程序转换一下就行了，在我们这个模拟器里无论是本机还是模拟器都小端模式，因此两者的内存是完全可以直接访问的。
+在arm和x86都是通过内存地址访问内存，我们编程操作内存的方式是完全相同的，唯一的区别可能就是大小端字节序的问题，如果字节序不同，写一个转换程序转换一下就行了，在我们这个模拟器里无论是本机还是模拟器都是小端模式，因此两者在内存中的数据是完全相同的。
 
-搞清楚了这个问题再看uc_mem_map_ptr()实际上它是给我们提供了一个能够完全自由访问模拟器内存的机会
 ```c
 #define ADDRESS            0x8000
 #define TOTAL_MEMORY       1024 * 1024 * 4
@@ -409,21 +408,198 @@ uc_mem_map_ptr(uc, ADDRESS, TOTAL_MEMORY, UC_PROT_ALL, mem);
 ```
 采用这种方式给模拟器初始化内存后，我们对mem的读写会直接影响到模拟器里面运行的程序，同时模拟器里面的程序对内存的读写也会立刻影响到本机代码，也就是说模拟器里外都是同一片内存。
 
-这里面唯一需要注意的是内存地址的区别，在模拟器里面这块内存的首地址是我们设置的0x8000，如果直接拿模拟器返回的地址当指针用的话一定是会出错的，因此在与模拟器内部通信时必需要经过一次地址转换：
+这里面唯一需要注意的是内存地址的区别，在模拟器里面这块内存的首地址是我们设置的0x8000，而在模拟器外面它是由系统分配的一个地址，因此如果直接拿模拟器返回的地址当指针用的话一定是会出错的，把地址直接传递给模拟器在里面也是无法使用的，所以在与模拟器内部通信时必需要经过一次地址转换：
 ```c
-// 模拟器内部地址转换成指针
+// 模拟器内部地址转换成本地指针
 void *toPtr(uint32_t addr) {
     return mem + (addr - ADDRESS);
 }
 
-// 指针转换成模拟器内部地址
+// 本地指针转换成模拟器内部地址
 uint32_t toAddr(void *ptr) {
     return ((uint8_t *)ptr - mem) + ADDRESS;
 }
 ```
 
+前面说了uc_mem_map_ptr()仍然有许多限制，因此要想方便的使用malloc()和free()必需要自己实现malloc()和free()，下面是一个超小的内存管理器代码：
+```c
+typedef struct {
+    uint32 next;
+    uint32 len;
+} LG_mem_free_t;
 
+uint32 LG_mem_min;
+uint32 LG_mem_top;
+LG_mem_free_t LG_mem_free;
+char *LG_mem_base;
+uint32 LG_mem_len;
+char *Origin_LG_mem_base;
+uint32 Origin_LG_mem_len;
+char *LG_mem_end;
+uint32 LG_mem_left;
 
+#define realLGmemSize(x) (((x) + 7) & (0xfffffff8))
+
+// 初始化内存管理器
+// baseAddress:  托管的内存的首地址，是一个模拟器内的地址
+// len:          内存的总长度
+void initMemoryManager(uint32 baseAddress, uint32 len) {
+    printf("initMemoryManager: baseAddress:0x%X len: 0x%X\n", baseAddress, len);
+    Origin_LG_mem_base = toPtr(baseAddress);
+    Origin_LG_mem_len = len;
+
+    LG_mem_base = (char *)((uint32)(Origin_LG_mem_base + 3) & (~3));
+    LG_mem_len = (Origin_LG_mem_len - (LG_mem_base - Origin_LG_mem_base)) & (~3);
+    LG_mem_end = LG_mem_base + LG_mem_len;
+    LG_mem_free.next = 0;
+    LG_mem_free.len = 0;
+    ((LG_mem_free_t *)LG_mem_base)->next = LG_mem_len;
+    ((LG_mem_free_t *)LG_mem_base)->len = LG_mem_len;
+    LG_mem_left = LG_mem_len;
+#ifdef MEM_DEBUG
+    LG_mem_min = LG_mem_len;
+    LG_mem_top = 0;
+#endif
+}
+
+void *my_malloc(uint32 len) {
+    LG_mem_free_t *previous, *nextfree, *l;
+    void *ret;
+
+    len = (uint32)realLGmemSize(len);
+    if (len >= LG_mem_left) {
+        printf("my_malloc no memory\n");
+        goto err;
+    }
+    if (!len) {
+        printf("my_malloc invalid memory request");
+        goto err;
+    }
+    if (LG_mem_base + LG_mem_free.next > LG_mem_end) {
+        printf("my_malloc corrupted memory");
+        goto err;
+    }
+    previous = &LG_mem_free;
+    nextfree = (LG_mem_free_t *)(LG_mem_base + previous->next);
+    while ((char *)nextfree < LG_mem_end) {
+        if (nextfree->len == len) {
+            previous->next = nextfree->next;
+            LG_mem_left -= len;
+#ifdef MEM_DEBUG
+            if (LG_mem_left < LG_mem_min)
+                LG_mem_min = LG_mem_left;
+            if (LG_mem_top < previous->next)
+                LG_mem_top = previous->next;
+#endif
+            ret = (void *)nextfree;
+            goto end;
+        }
+        if (nextfree->len > len) {
+            l = (LG_mem_free_t *)((char *)nextfree + len);
+            l->next = nextfree->next;
+            l->len = (uint32)(nextfree->len - len);
+            previous->next += len;
+            LG_mem_left -= len;
+#ifdef MEM_DEBUG
+            if (LG_mem_left < LG_mem_min)
+                LG_mem_min = LG_mem_left;
+            if (LG_mem_top < previous->next)
+                LG_mem_top = previous->next;
+#endif
+            ret = (void *)nextfree;
+            goto end;
+        }
+        previous = nextfree;
+        nextfree = (LG_mem_free_t *)(LG_mem_base + nextfree->next);
+    }
+    printf("my_malloc no memory\n");
+err:
+    return 0;
+end:
+    return ret;
+}
+
+void my_free(void *p, uint32 len) {
+    LG_mem_free_t *free, *n;
+    len = (uint32)realLGmemSize(len);
+#ifdef MEM_DEBUG
+    if (!len || !p || (char *)p < LG_mem_base || (char *)p >= LG_mem_end || (char *)p + len > LG_mem_end || (char *)p + len <= LG_mem_base) {
+        printf("my_free invalid\n");
+        printf("p=%d,l=%d,base=%d,LG_mem_end=%d\n", (int32)p, len, (int32)LG_mem_base, (int32)LG_mem_end);
+        return;
+    }
+#endif
+    free = &LG_mem_free;
+    n = (LG_mem_free_t *)(LG_mem_base + free->next);
+    while (((char *)n < LG_mem_end) && ((void *)n < p)) {
+        free = n;
+        n = (LG_mem_free_t *)(LG_mem_base + n->next);
+    }
+#ifdef MEM_DEBUG
+    if (p == (void *)free || p == (void *)n) {
+        printf("my_free:already free\n");
+        return;
+    }
+#endif
+    if ((free != &LG_mem_free) && ((char *)free + free->len == p)) {
+        free->len += len;
+    } else {
+        free->next = (uint32)((char *)p - LG_mem_base);
+        free = (LG_mem_free_t *)p;
+        free->next = (uint32)((char *)n - LG_mem_base);
+        free->len = len;
+    }
+    if (((char *)n < LG_mem_end) && ((char *)p + len == (char *)n)) {
+        free->next = n->next;
+        free->len += n->len;
+    }
+    LG_mem_left += len;
+}
+```
+
+由于上面的my_free()在释放内存时要求传入释放内存的长度，与c语言的free()用法不同，因此还需要增加两个包装后的函数：
+```c
+void *my_mallocExt(uint32 len) {
+    uint32 *p;
+    if (len == 0) {
+        return NULL;
+    }
+    p = my_malloc(len + sizeof(uint32));
+    if (p) {
+        *p = len;
+        return (void *)(p + 1);
+    }
+    return p;
+}
+
+void my_freeExt(void *p) {
+    if (p) {
+        uint32 *t = (uint32 *)p - 1;
+        my_free(t, *t + sizeof(uint32));
+    }
+}
+```
+my_mallocExt()和my_freeExt()直接替换系统的malloc()和free()进行内存管理，通过这种方式获得的内存只需要通过 **地址转换函数** 处理一下就可以在模拟器内外自由使用了。
+
+一个常见的用法是传递字符串：
+```c
+uint32_t copyStrToEmu(char *str) {
+    if (!str) return 0;
+    uint32_t len = strlen(str) + 1;
+    void *p = my_mallocExt(len);
+    memcpy(p, str, len);
+    return toAddr(p);
+}
+
+// str 将是一个模拟器内的地址，直接传递给模拟器
+uint32_t str = copyStrToEmu("test.txt");
+
+// str2 将是一个本地指针，可以直接使用
+char *str2 = toPtr(str);
+printf("%s\n", str2);
+```
+
+## 栈内存
 
 
 
